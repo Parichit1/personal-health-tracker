@@ -37,3 +37,14 @@ export async function addMatchedQuery(foodItemId: number, normalizedQuery: strin
       .where(eq(foodItems.id, foodItemId));
   }
 }
+
+/**
+ * Wipes the entire USDA lookup cache. Safe: food_items is purely a cache —
+ * the source of truth is USDA, so anything cleared just gets re-resolved
+ * fresh next time it's needed. Never touches meals/ingredients (your actual
+ * logged history). Exists as a stopgap until Phase 6's Food Memory screen
+ * provides a real per-entry inspect/edit/delete UI.
+ */
+export async function clearAllFoodItems(): Promise<void> {
+  await db.delete(foodItems);
+}

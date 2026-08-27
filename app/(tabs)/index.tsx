@@ -3,6 +3,7 @@ import { useFocusEffect } from 'expo-router';
 import { Pressable, StyleSheet, Text, TextInput, View } from 'react-native';
 
 import { getAppMetaValue, setAppMetaValue } from '../../src/db/appMetaStore';
+import { clearAllFoodItems } from '../../src/db/repositories/foodItems.repo';
 import { getMealsForDate } from '../../src/db/repositories/meals.repo';
 import { getDailyTargets, setDailyTargets, type DailyTargets } from '../../src/db/repositories/targets.repo';
 
@@ -37,6 +38,7 @@ export default function TodayScreen() {
   const [mealCount, setMealCount] = useState(0);
   const [targets, setTargets] = useState<DailyTargets>(EMPTY_TARGETS);
   const [isEditingTargets, setIsEditingTargets] = useState(false);
+  const [cacheClearedMessage, setCacheClearedMessage] = useState<string | null>(null);
   const [targetDrafts, setTargetDrafts] = useState<Record<keyof DailyTargets, string>>({
     calories: '',
     proteinG: '',
@@ -120,6 +122,15 @@ export default function TodayScreen() {
     setIsEditingTargets(false);
   }
 
+  async function handleClearFoodCache() {
+    try {
+      await clearAllFoodItems();
+      setCacheClearedMessage('Food match cache cleared — next log will re-look-up everything fresh.');
+    } catch (err) {
+      setCacheClearedMessage(`Failed to clear cache: ${(err as Error).message}`);
+    }
+  }
+
   return (
     <View style={styles.container}>
       <Text style={styles.title}>Today</Text>
@@ -184,6 +195,11 @@ export default function TodayScreen() {
         <Text style={styles.statusLabel}>Database sanity check</Text>
         <Text style={styles.statusText}>{dbStatus}</Text>
       </View>
+
+      <Pressable style={styles.clearCacheButton} onPress={handleClearFoodCache}>
+        <Text style={styles.clearCacheButtonText}>Clear cached food matches</Text>
+      </Pressable>
+      {cacheClearedMessage && <Text style={styles.clearCacheMessage}>{cacheClearedMessage}</Text>}
     </View>
   );
 }
@@ -227,6 +243,23 @@ const styles = StyleSheet.create({
     fontSize: 14,
     color: '#0066cc',
     fontWeight: '600',
+  },
+  clearCacheButton: {
+    paddingVertical: 10,
+    paddingHorizontal: 14,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#999',
+    alignSelf: 'flex-start',
+  },
+  clearCacheButtonText: {
+    fontSize: 13,
+    color: '#333',
+    fontWeight: '600',
+  },
+  clearCacheMessage: {
+    fontSize: 12,
+    color: '#666',
   },
   editBox: {
     padding: 16,

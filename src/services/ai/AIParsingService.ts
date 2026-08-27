@@ -24,6 +24,8 @@ export interface ParsedIngredient {
   statedCarbsG: number | null;
   statedFatG: number | null;
   statedFiberG: number | null;
+  /** 1 = ate all of it (the common case). Less than 1 only when the user explicitly said they didn't eat all of it. */
+  fractionEaten: number;
 }
 
 export interface ParsedMeal {
@@ -37,6 +39,18 @@ export interface ParseContext {
   loggedAt: string;
 }
 
+export interface NutritionEstimate {
+  caloriesKcal: number;
+  proteinG: number;
+  carbsG: number;
+  fatG: number;
+  fiberG: number;
+}
+
 export interface AIParsingService {
   parseMeal(text: string, context: ParseContext): Promise<ParsedMeal>;
+  /** Interprets a free-text answer to a clarification prompt for one specific ingredient (e.g. "150g" or "about 40 cal"). */
+  parseClarification(itemName: string, answerText: string): Promise<ParsedIngredient>;
+  /** Only ever called when the user explicitly opts in ("I don't know, estimate it") — never on the system's own initiative. */
+  estimateNutrition(itemName: string): Promise<NutritionEstimate>;
 }

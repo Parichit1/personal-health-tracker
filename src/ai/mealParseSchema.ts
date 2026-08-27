@@ -16,7 +16,7 @@ import { z } from 'zod';
  * strict structured-output mode requires every property to be listed —
  * "optional" is represented as nullable, not absent.
  */
-const ParsedIngredientSchema = z.object({
+export const ParsedIngredientSchema = z.object({
   name: z.string().describe('Ingredient/item name as stated, normalized (e.g. "chicken breast", "coffee").'),
   mode: z
     .enum(['measured', 'stated'])
@@ -59,6 +59,20 @@ const ParsedIngredientSchema = z.object({
     .number()
     .nullable()
     .describe('Fiber in grams if the user stated it; null if not mentioned or mode is "measured".'),
+  fractionEaten: z
+    .number()
+    .min(0)
+    .max(1)
+    .describe(
+      'The fraction of this ingredient that was actually eaten. 1 (the common case) unless the user explicitly ' +
+        'said they did not eat all of it. Disambiguation rule: if the "only ate part of it" phrase does NOT name a ' +
+        'specific ingredient (e.g. "1 cup rice with 200g chicken, I only ate half of it" — "it" names nothing ' +
+        'specific), apply the fraction to EVERY ingredient in the meal equally. Only apply it to a single ' +
+        'ingredient when that ingredient is explicitly named in the fraction phrase itself (e.g. "200g rice with ' +
+        '300g chicken breast, but only had half the chicken" -> chicken fractionEaten=0.5, rice fractionEaten=1). ' +
+        'Never invent a fraction that was not implied by the text, and never default an unnamed fraction to just ' +
+        'the most-recently-mentioned ingredient.',
+    ),
 });
 
 export const MealParseSchema = z.object({
@@ -74,3 +88,26 @@ export const MealParseSchema = z.object({
 
 export type MealParseOutput = z.infer<typeof MealParseSchema>;
 export type ParsedIngredientOutput = z.infer<typeof ParsedIngredientSchema>;
+
+/**
+ * Used when the user answers a clarification prompt for one specific
+ * ingredient that couldn't be resolved (e.g. "150g" or "about 40 cal").
+ * Same shape as one entry of MealParseSchema's ingredients array, since the
+ * answer is exactly that — a quantity to look up, or stated nutrition.
+ */
+export const ClarificationAnswerSchema = ParsedIngredientSchema;
+export type ClarificationAnswerOutput = z.infer<typeof ClarificationAnswerSchema>;
+
+/**
+ * Used only when the user explicitly asks for an AI estimate (they said
+ * they don't know the amount/calories) — never invoked on the system's own
+ * initiative. Always treated as an estimate, never as looked-up data.
+ */
+export const NutritionEstimateSchema = z.object({
+  caloriesKcal: z.number().describe('A single reasonable typical estimate for this item, in kcal.'),
+  proteinG: z.number().describe('Estimated protein in grams. 0 if negligible.'),
+  carbsG: z.number().describe('Estimated carbs in grams. 0 if negligible.'),
+  fatG: z.number().describe('Estimated fat in grams. 0 if negligible.'),
+  fiberG: z.number().describe('Estimated fiber in grams. 0 if negligible.'),
+});
+export type NutritionEstimateOutput = z.infer<typeof NutritionEstimateSchema>;

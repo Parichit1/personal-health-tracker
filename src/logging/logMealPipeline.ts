@@ -7,15 +7,17 @@ import type { MealType, ParsedIngredient, RawOrCooked } from '../services/ai/AIP
 import type { FoodDetails } from '../services/nutrition/NutritionDataSource';
 
 /**
- * Thrown whenever the AI call fails or an ingredient can't be resolved to
- * real nutrition data. Never caught to silently produce a partial draft —
- * the caller (the Log screen) must show the error and save nothing.
+ * Thrown only for whole-draft failures (the AI couldn't parse the message
+ * at all, or you try to confirm a draft that still has unresolved
+ * ingredients). Per-ingredient resolution problems no longer throw — they
+ * become a `needsClarification` ingredient instead, resolved via
+ * resolveClarificationAnswer/resolveWithEstimate.
  */
 export class MealDraftError extends Error {}
 
 export interface DraftIngredient {
   nameAsLogged: string;
-  /** null for "stated" ingredients — there's no measurable amount. */
+  /** null for "stated"/estimated/pending ingredients — there's no measurable amount. */
   quantity: number | null;
   unit: string | null;
   rawOrCooked: RawOrCooked;
@@ -23,7 +25,13 @@ export interface DraftIngredient {
   isApproximateConversion: boolean;
   /** True when this ingredient's numbers came directly from the user, never looked up. */
   isUserStated: boolean;
-  /** null for "stated" ingredients — nothing was resolved against food_items. */
+  /** True when this ingredient's numbers are an AI estimate the user explicitly asked for, never looked up or stated. */
+  isEstimated: boolean;
+  /** True when this ingredient couldn't be resolved yet and needs an answer or an estimate before the meal can be saved. */
+  needsClarification: boolean;
+  /** 1 = ate all of the stated/measured amount. Less than 1 when the user said they only ate part of it; already baked into caloriesKcal/proteinG/etc below. */
+  fractionEaten: number;
+  /** null for "stated"/estimated/pending ingredients — nothing was resolved against food_items. */
   foodItemId: number | null;
   caloriesKcal: number;
   proteinG: number;
@@ -45,16 +53,22 @@ export interface MealDraft {
   totalFiberG: number;
 }
 
-function normalizeQuery(name: string): string {
-  return name.trim().toLowerCase();
+/**
+ * Cache key includes raw/cooked state — raw and cooked chicken have
+ * meaningfully different nutrition profiles, so "chicken breast|cooked" and
+ * "chicken breast|raw" must never share a cache entry.
+ */
+function buildCacheKey(name: string, rawOrCooked: RawOrCooked): string {
+  return `${name.trim().toLowerCase()}|${rawOrCooked}`;
 }
 
 async function resolveFoodDetails(
   ingredientName: string,
+  rawOrCooked: RawOrCooked,
 ): Promise<{ details: FoodDetails; foodItemId: number }> {
-  const normalizedQuery = normalizeQuery(ingredientName);
+  const cacheKey = buildCacheKey(ingredientName, rawOrCooked);
 
-  const cached = await findCachedByQuery(normalizedQuery);
+  const cached = await findCachedByQuery(cacheKey);
   if (cached) {
     return {
       foodItemId: cached.id,
@@ -74,11 +88,15 @@ async function resolveFoodDetails(
     };
   }
 
-  const resolved = await services.nutrition.resolveBestMatch(ingredientName);
+  // Including the raw/cooked qualifier in the actual search text measurably
+  // improves USDA's match quality (e.g. surfaces "cooked, roasted" chicken
+  // breast entries instead of raw ones) on top of the relevance re-ranking
+  // in pickBestMatch.
+  const searchQuery = rawOrCooked !== 'unspecified' ? `${ingredientName} ${rawOrCooked}` : ingredientName;
+
+  const resolved = await services.nutrition.resolveBestMatch(searchQuery);
   if (!resolved) {
-    throw new MealDraftError(
-      `Could not find nutrition data for "${ingredientName}" in USDA FoodData Central. Try a simpler or more common name.`,
-    );
+    throw new MealDraftError(`Couldn't find nutrition data for "${ingredientName}" in USDA FoodData Central.`);
   }
 
   const created = await createFoodItem({
@@ -92,29 +110,52 @@ async function resolveFoodDetails(
     carbsPer100g: resolved.carbsPer100g,
     fatPer100g: resolved.fatPer100g,
     fiberPer100g: resolved.fiberPer100g,
-    rawOrCooked: 'unspecified',
+    rawOrCooked,
     lastFetchedAt: new Date().toISOString(),
-    matchedQueries: JSON.stringify([normalizedQuery]),
+    matchedQueries: JSON.stringify([cacheKey]),
   });
 
   return { foodItemId: created.id, details: resolved };
 }
 
+function needsClarificationIngredient(name: string, rawOrCooked: RawOrCooked, reason: string): DraftIngredient {
+  return {
+    nameAsLogged: name,
+    quantity: null,
+    unit: null,
+    rawOrCooked,
+    resolvedDescription: reason,
+    isApproximateConversion: false,
+    isUserStated: false,
+    isEstimated: false,
+    needsClarification: true,
+    fractionEaten: 1,
+    foodItemId: null,
+    caloriesKcal: 0,
+    proteinG: 0,
+    carbsG: 0,
+    fatG: 0,
+    fiberG: 0,
+  };
+}
+
 /**
- * Resolves one parsed ingredient into a DraftIngredient. Ingredients are
- * independent of each other, so parseMealDraft runs these concurrently
- * (Promise.all) instead of one-at-a-time — a 4-ingredient meal previously
- * meant 4 sequential round-trips to USDA, which was most of the remaining
- * latency after the AI call itself got faster.
+ * Core resolution logic — may throw MealDraftError for problems deeper than
+ * "insufficient info" (no USDA match, unrecognized unit). Only called
+ * through resolveIngredient below, which converts any such failure into a
+ * needsClarification result instead of letting it fail the whole draft.
  */
-async function resolveIngredient(ingredient: ParsedIngredient): Promise<DraftIngredient> {
+async function resolveParsedIngredientOrThrow(ingredient: ParsedIngredient): Promise<DraftIngredient> {
   if (ingredient.mode === 'stated') {
     if (ingredient.statedCalories == null) {
-      throw new MealDraftError(
-        `"${ingredient.name}" was recognized as directly-stated nutrition, but no calorie value came through — try restating it with a calorie number.`,
+      return needsClarificationIngredient(
+        ingredient.name,
+        ingredient.rawOrCooked,
+        'No quantity or calorie value was given for this item.',
       );
     }
 
+    const fraction = ingredient.fractionEaten;
     return {
       nameAsLogged: ingredient.name,
       quantity: null,
@@ -123,22 +164,29 @@ async function resolveIngredient(ingredient: ParsedIngredient): Promise<DraftIng
       resolvedDescription: 'as you stated (not looked up)',
       isApproximateConversion: false,
       isUserStated: true,
+      isEstimated: false,
+      needsClarification: false,
+      fractionEaten: fraction,
       foodItemId: null,
-      caloriesKcal: ingredient.statedCalories,
-      proteinG: ingredient.statedProteinG ?? 0,
-      carbsG: ingredient.statedCarbsG ?? 0,
-      fatG: ingredient.statedFatG ?? 0,
-      fiberG: ingredient.statedFiberG ?? 0,
+      caloriesKcal: ingredient.statedCalories * fraction,
+      proteinG: (ingredient.statedProteinG ?? 0) * fraction,
+      carbsG: (ingredient.statedCarbsG ?? 0) * fraction,
+      fatG: (ingredient.statedFatG ?? 0) * fraction,
+      fiberG: (ingredient.statedFiberG ?? 0) * fraction,
     };
   }
 
   if (ingredient.quantity == null || ingredient.unit == null) {
-    throw new MealDraftError(`"${ingredient.name}" is missing a quantity or unit to look up.`);
+    return needsClarificationIngredient(
+      ingredient.name,
+      ingredient.rawOrCooked,
+      'No quantity or calorie value was given for this item.',
+    );
   }
   const quantity = ingredient.quantity;
   const unit = ingredient.unit;
 
-  const { details, foodItemId } = await resolveFoodDetails(ingredient.name);
+  const { details, foodItemId } = await resolveFoodDetails(ingredient.name, ingredient.rawOrCooked);
 
   let grams: number;
   let isApproximateConversion: boolean;
@@ -154,15 +202,16 @@ async function resolveIngredient(ingredient: ParsedIngredient): Promise<DraftIng
     const normalizedUnit = normalizeUnit(unit);
     const portion = detail.portions.find((p) => p.unitLabel.toLowerCase().includes(normalizedUnit));
     if (!portion) {
-      throw new MealDraftError(
-        `Don't know how many grams a "${unit}" of "${ingredient.name}" is — try stating it in grams, ounces, or another standard unit instead.`,
-      );
+      throw new MealDraftError(`Don't know how many grams a "${unit}" of "${ingredient.name}" is.`);
     }
     grams = portion.gramWeight * quantity;
     isApproximateConversion = true;
   }
 
-  const factor = grams / 100;
+  // The stated quantity/unit reflects how much was made/served; the eaten
+  // fraction is applied on top, on the resulting nutrition, so the preview
+  // can show both the stated amount and what was actually consumed.
+  const factor = (grams / 100) * ingredient.fractionEaten;
 
   return {
     nameAsLogged: ingredient.name,
@@ -172,6 +221,9 @@ async function resolveIngredient(ingredient: ParsedIngredient): Promise<DraftIng
     resolvedDescription: details.description,
     isApproximateConversion,
     isUserStated: false,
+    isEstimated: false,
+    needsClarification: false,
+    fractionEaten: ingredient.fractionEaten,
     foodItemId,
     caloriesKcal: details.caloriesPer100g * factor,
     proteinG: details.proteinPer100g * factor,
@@ -182,9 +234,43 @@ async function resolveIngredient(ingredient: ParsedIngredient): Promise<DraftIng
 }
 
 /**
- * Parse -> resolve -> compute. Writes nothing to the database. Throws
- * MealDraftError (or lets the AI call's own error propagate) if anything
- * can't be resolved — the caller must not persist a partial result.
+ * Resolves one parsed ingredient into a DraftIngredient. Never throws for
+ * resolution problems (missing info, no USDA match, unknown unit) — those
+ * become a needsClarification ingredient so one problem item doesn't block
+ * the rest of the meal from being previewed. Ingredients are independent of
+ * each other, so parseMealDraft resolves them concurrently.
+ */
+async function resolveIngredient(ingredient: ParsedIngredient): Promise<DraftIngredient> {
+  try {
+    return await resolveParsedIngredientOrThrow(ingredient);
+  } catch (err) {
+    if (err instanceof MealDraftError) {
+      return needsClarificationIngredient(ingredient.name, ingredient.rawOrCooked, err.message);
+    }
+    throw err;
+  }
+}
+
+export function computeTotals(ingredients: DraftIngredient[]) {
+  let totalCalories = 0;
+  let totalProteinG = 0;
+  let totalCarbsG = 0;
+  let totalFatG = 0;
+  let totalFiberG = 0;
+  for (const ing of ingredients) {
+    totalCalories += ing.caloriesKcal;
+    totalProteinG += ing.proteinG;
+    totalCarbsG += ing.carbsG;
+    totalFatG += ing.fatG;
+    totalFiberG += ing.fiberG;
+  }
+  return { totalCalories, totalProteinG, totalCarbsG, totalFatG, totalFiberG };
+}
+
+/**
+ * Parse -> resolve -> compute. Writes nothing to the database. Only throws
+ * if the AI call itself fails (message couldn't be understood at all) —
+ * per-ingredient problems show up as needsClarification ingredients instead.
  */
 export async function parseMealDraft(
   sourceText: string,
@@ -195,19 +281,7 @@ export async function parseMealDraft(
 
   // Ingredients don't depend on each other, so resolve them concurrently.
   const draftIngredients = await Promise.all(parsed.ingredients.map(resolveIngredient));
-
-  let totalCalories = 0;
-  let totalProteinG = 0;
-  let totalCarbsG = 0;
-  let totalFatG = 0;
-  let totalFiberG = 0;
-  for (const ing of draftIngredients) {
-    totalCalories += ing.caloriesKcal;
-    totalProteinG += ing.proteinG;
-    totalCarbsG += ing.carbsG;
-    totalFatG += ing.fatG;
-    totalFiberG += ing.fiberG;
-  }
+  const totals = computeTotals(draftIngredients);
 
   return {
     sourceText,
@@ -215,16 +289,53 @@ export async function parseMealDraft(
     mealType: parsed.mealType,
     name: parsed.name,
     ingredients: draftIngredients,
-    totalCalories,
-    totalProteinG,
-    totalCarbsG,
-    totalFatG,
-    totalFiberG,
+    ...totals,
+  };
+}
+
+/** Re-resolves one pending ingredient from the user's free-text answer to a clarification prompt. May itself come back needing clarification again if the answer was still insufficient. */
+export async function resolveClarificationAnswer(
+  itemName: string,
+  rawOrCooked: RawOrCooked,
+  answerText: string,
+): Promise<DraftIngredient> {
+  const parsed = await services.ai.parseClarification(itemName, answerText);
+  const merged: ParsedIngredient = {
+    ...parsed,
+    rawOrCooked: parsed.rawOrCooked !== 'unspecified' ? parsed.rawOrCooked : rawOrCooked,
+  };
+  return resolveIngredient(merged);
+}
+
+/** Only ever called when the user explicitly taps "estimate for me" — never automatically. */
+export async function resolveWithEstimate(itemName: string): Promise<DraftIngredient> {
+  const estimate = await services.ai.estimateNutrition(itemName);
+  return {
+    nameAsLogged: itemName,
+    quantity: null,
+    unit: null,
+    rawOrCooked: 'unspecified',
+    resolvedDescription: 'AI estimate — not measured, use with caution',
+    isApproximateConversion: false,
+    isUserStated: false,
+    isEstimated: true,
+    needsClarification: false,
+    fractionEaten: 1,
+    foodItemId: null,
+    caloriesKcal: estimate.caloriesKcal,
+    proteinG: estimate.proteinG,
+    carbsG: estimate.carbsG,
+    fatG: estimate.fatG,
+    fiberG: estimate.fiberG,
   };
 }
 
 /** Only ever called after the user has explicitly confirmed the draft shown on screen. */
 export async function confirmAndSaveMeal(draft: MealDraft): Promise<number> {
+  if (draft.ingredients.some((ing) => ing.needsClarification)) {
+    throw new MealDraftError('Every ingredient must be resolved before saving.');
+  }
+
   const recipeId = await findOrCreateRecipe(draft.name);
 
   const ingredientsInput: SaveMealIngredientInput[] = draft.ingredients.map((ing) => ({
